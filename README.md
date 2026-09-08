@@ -60,6 +60,17 @@ Ctrl-C stops remaining children and retains partial logs, which may still show
 status `running` because those processes are killed.
 Optional paths: `--env /path/to/.env --output /path/to/runs`.
 
+## Plot a completed batch
+
+```sh
+uv run plot_batch.py runs/fable-astra-batch-<id>
+```
+
+Writes `tension.png` and `tension.svg` in the batch directory. Add `--video` to
+also write `tension.mp4`, revealing the trajectories from left to right at half
+a second per round. Use `--seconds-per-round N` to change the pace. MP4 output
+requires FFmpeg to be installed.
+
 ## Mechanics
 
 Balance and tension each range from 0 to 10 and start at 5. Balance 0 means

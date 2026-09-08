@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Plot batch tension with raw trajectories and spline-smoothed group means."""
 import argparse
+from bisect import bisect_right
 import json
 from pathlib import Path
 from statistics import mean
@@ -8,6 +9,7 @@ from statistics import mean
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, writers
 from matplotlib.lines import Line2D
 from matplotlib.offsetbox import AnnotationBbox, TextArea
 from scipy.interpolate import make_smoothing_spline
@@ -48,7 +50,7 @@ def load_groups(batch):
     return groups
 
 
-def plot(batch, output):
+def plot(batch, output, video=False, seconds_per_round=0.5, fps=30):
     groups = load_groups(batch)
     horizon = max(game['config']['rounds'] for games in groups.values() for game, _ in games)
     total = sum(map(len, groups.values()))
@@ -64,17 +66,20 @@ def plot(batch, output):
                 fontsize=13, color=MUTED)
     handles = []
     civil_wars = []
+    reveal_artists = []
     for name, games in groups.items():
         label, light, strong = GROUPS[name]
         handles.append(Line2D([], [], color=strong, linewidth=2.2,
                               label=f'{label} ({len(games)})'))
         for game, values in games:
-            axes.plot(range(len(values)), values, color=light, linewidth=1.1,
-                      alpha=0.7, solid_capstyle='round', zorder=2)
+            line, = axes.plot(range(len(values)), values, color=light, linewidth=1.1,
+                              alpha=0.7, solid_capstyle='round', zorder=2)
+            reveal_artists.append((line, tuple(line.get_xdata()), tuple(line.get_ydata())))
             if 'civil_war' in game['outcomes']:
-                civil_wars.append((len(values) - 1, game['batch_game_number'], strong))
-                axes.scatter([len(values) - 1], [values[-1]], s=48,
-                             facecolor=BACKGROUND, edgecolor=strong, linewidth=1.2, zorder=5)
+                marker = axes.scatter([len(values) - 1], [values[-1]], s=48,
+                                      facecolor=BACKGROUND, edgecolor=strong,
+                                      linewidth=1.2, zorder=5)
+                civil_wars.append((len(values) - 1, game['batch_game_number'], strong, marker))
         rounds = list(range(max(len(values) for _, values in games)))
         averages = [mean(values[number] for _, values in games if number < len(values))
                     for number in rounds]
@@ -84,15 +89,17 @@ def plot(batch, output):
             smooth_rounds = [step / 20 for step in range(rounds[-1] * 20 + 1)]
             trend = spline(smooth_rounds)
         trend = [max(0.0, min(10.0, float(value))) for value in trend]
-        axes.plot(smooth_rounds, trend, color=strong, linewidth=2.2,
+        line, = axes.plot(smooth_rounds, trend, color=strong, linewidth=2.2,
                   solid_capstyle='round', zorder=4)
+        reveal_artists.append((line, tuple(line.get_xdata()), tuple(line.get_ydata())))
     figure.legend(handles=handles, loc='upper left', bbox_to_anchor=(0.064, 0.83),
                   ncol=3, frameon=False, fontsize=11, handlelength=2.5, columnspacing=2)
     axes.axhline(10, color='#454d50', linewidth=1.1, linestyle=(0, (5, 3)), zorder=1)
     axes.text(horizon, 10.3, 'Civil war threshold', ha='right', color='#000000',
               fontsize=11, fontweight='medium', fontfamily='GT Walsheim Pro')
     civil_wars.sort()
-    for index, (number, game_number, color) in enumerate(civil_wars):
+    civil_war_artists = []
+    for index, (number, game_number, color, marker) in enumerate(civil_wars):
         label_round = number
         label_height = 11.65
         if index + 1 < len(civil_wars) and civil_wars[index + 1][0] - number < 3:
@@ -104,11 +111,13 @@ def plot(batch, output):
             label_round -= 1.5
         heading = TextArea('Civil war', textprops={'fontsize': 10, 'fontweight': 'medium',
                    'fontfamily': 'GT Walsheim Pro', 'color': '#000000'})
-        axes.add_artist(AnnotationBbox(
+        annotation = AnnotationBbox(
             heading, (number, 10), xybox=(label_round, label_height),
             xycoords='data', boxcoords='data', box_alignment=(0.5, 1), frameon=False, pad=0,
             arrowprops={'arrowstyle': '-', 'color': GRID, 'linewidth': 0.9, 'shrinkB': 4,
-                        'connectionstyle': 'angle,angleA=0,angleB=90,rad=0'}))
+                        'connectionstyle': 'angle,angleA=0,angleB=90,rad=0'})
+        axes.add_artist(annotation)
+        civil_war_artists.append((number, marker, annotation))
     axes.set(xlim=(0, horizon + 0.15), ylim=(0, 12),
              xticks=list(range(0, horizon + 1, 2)), yticks=list(range(2, 11, 2)))
     axes.set_xlabel('Round', loc='right', labelpad=10, color=MUTED)
@@ -127,6 +136,42 @@ def plot(batch, output):
         destination = output.with_suffix('.' + suffix)
         figure.savefig(destination, dpi=170, facecolor=BACKGROUND)
         print(destination)
+    if video:
+        if seconds_per_round <= 0:
+            raise ValueError('seconds_per_round must be positive')
+        if not writers.is_available('ffmpeg'):
+            raise RuntimeError('FFmpeg is required to write MP4 video')
+        frame_count = round(horizon * seconds_per_round * fps) + 1
+
+        def reveal(frame):
+            round_number = min(horizon, frame / fps / seconds_per_round)
+            for artist, x_values, y_values in reveal_artists:
+                end = bisect_right(x_values, round_number)
+                visible_x = list(x_values[:end])
+                visible_y = list(y_values[:end])
+                if frame > 0 and end < len(x_values) and visible_x[-1] < round_number:
+                    fraction = ((round_number - visible_x[-1]) /
+                                (x_values[end] - visible_x[-1]))
+                    visible_x.append(round_number)
+                    visible_y.append(visible_y[-1] + fraction * (y_values[end] - visible_y[-1]))
+                if frame > 0:
+                    artist.set_data(visible_x, visible_y)
+                else:
+                    artist.set_data([], [])
+            for civil_war_round, marker, annotation in civil_war_artists:
+                visible = round_number >= civil_war_round
+                marker.set_visible(visible)
+                annotation.set_visible(visible)
+            return ([artist for artist, _, _ in reveal_artists] +
+                    [artist for _, marker, annotation in civil_war_artists
+                     for artist in (marker, annotation)])
+
+        animation = FuncAnimation(figure, reveal, frames=frame_count,
+                                  interval=1000 / fps, blit=False)
+        destination = output.with_suffix('.mp4')
+        animation.save(destination, writer='ffmpeg', fps=fps, dpi=170,
+                       savefig_kwargs={'facecolor': BACKGROUND})
+        print(destination)
     plt.close(figure)
 
 
@@ -134,5 +179,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('batch', type=Path, help='Batch directory containing matchup/run/game.json files')
     parser.add_argument('--output', type=Path, help='Output path (PNG and SVG are written)')
+    parser.add_argument('--video', action='store_true', help='Also write an MP4 revealing lines by round')
+    parser.add_argument('--seconds-per-round', type=float, default=0.5,
+                        help='Video pacing (default: 0.5)')
     args = parser.parse_args()
-    plot(args.batch, args.output or args.batch / 'tension.png')
+    plot(args.batch, args.output or args.batch / 'tension.png', video=args.video,
+         seconds_per_round=args.seconds_per_round)
